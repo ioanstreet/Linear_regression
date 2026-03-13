@@ -1,0 +1,377 @@
+# =============================================================================
+# GEDI Canopy Height vs. Distance to Roads — Pará, Brazil
+# Linear Regression + Scatter Plot Analysis
+#
+# INPUTS REQUIRED:
+#   - gedi_csv_path   : CSV of GEDI points exported from ArcPro
+#                       Must have columns for longitude, latitude, and rh95
+#   - roads_shp_path  : Shapefile of roads clipped to Pará boundary
+#
+# OUTPUTS:
+#   - scatter plot PNG with regression line
+#   - binned mean canopy height plot PNG
+#   - CSV of results with distance column added
+#   - printed regression statistics
+#
+# INSTALL DEPENDENCIES (run once in Anaconda terminal):
+#   pip install geopandas shapely scipy scikit-learn statsmodels matplotlib seaborn
+# =============================================================================
+
+import pandas as pd
+import numpy as np
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from shapely.geometry import Point
+from shapely.strtree import STRtree
+import statsmodels.api as sm
+import warnings
+import os
+
+warnings.filterwarnings("ignore")
+
+# =============================================================================
+# 1. USER INPUTS — EDIT THESE
+# =============================================================================
+
+gedi_csv_path  = r"C:\Users\istreet\Downloads\gedi_prodes_2026_joined.csv"
+roads_gdb_path = r"C:\Users\istreet\Documents\ArcGIS\Projects\linear_regression\linear_regression.gdb"
+roads_layer    = "para_roads_1"
+output_folder  = r"C:\Users\istreet\Downloads\Linear_Regression_all_2026"
+
+# Column names in your GEDI CSV — adjust to match yours exactly
+LON_COL  = "longitude"   # e.g. "lon", "x", "POINT_X"
+LAT_COL  = "latitude"    # e.g. "lat", "y", "POINT_Y"
+RH95_COL = "rh95"        # rh95 canopy height metric column
+
+# Coordinate Reference Systems
+INPUT_CRS  = "EPSG:4326"   # WGS84 — standard for GEDI
+METRIC_CRS = "EPSG:32722"  # UTM Zone 22S — covers Pará (change if needed)
+
+# Chunk size for distance calculation — all points are used,
+# but processed in batches to avoid memory issues.
+CHUNK_SIZE = 100_000
+
+# Binned plot settings
+BIN_SIZE = 2000    # bin width in metres (2 km)
+MAX_DIST = 60000   # max distance to show in binned plot (60 km)
+
+# =============================================================================
+# 2. LOAD DATA
+# =============================================================================
+
+os.makedirs(output_folder, exist_ok=True)
+
+print("=" * 60)
+print("  GEDI Road Distance Regression — Pará")
+print("=" * 60)
+
+# --- Load GEDI CSV ---
+print(f"\n[1/6] Loading GEDI CSV...")
+gedi_df = pd.read_csv(gedi_csv_path)
+print(f"      Loaded {len(gedi_df):,} rows")
+print(f"      Columns: {list(gedi_df.columns)}")
+
+# =============================================================================
+# EARLY DATA DIAGNOSTIC — runs before anything else
+# Tells you immediately if the CSV is usable
+# =============================================================================
+print("\n" + "=" * 60)
+print("  CSV DIAGNOSTIC CHECK")
+print("=" * 60)
+
+print(f"\n  Shape:        {gedi_df.shape[0]:,} rows × {gedi_df.shape[1]} columns")
+print(f"\n  Column names:\n    {list(gedi_df.columns)}")
+print(f"\n  First 3 rows:")
+print(gedi_df.head(3).to_string())
+print(f"\n  Null counts per column:")
+print(gedi_df.isnull().sum().to_string())
+print(f"\n  Basic stats for numeric columns:")
+print(gedi_df.describe().to_string())
+
+# Check if expected columns exist
+missing_cols = [c for c in [LON_COL, LAT_COL, RH95_COL] if c not in gedi_df.columns]
+if missing_cols:
+    print(f"\n  *** WARNING: Expected columns NOT FOUND: {missing_cols}")
+    print(f"      Available columns: {list(gedi_df.columns)}")
+    print(f"      Update LON_COL / LAT_COL / RH95_COL at the top of the script.")
+    print(f"      Scroll up to see column names and pick the right ones.\n")
+    raise SystemExit("Fix column names before continuing.")
+else:
+    print(f"\n  ✓ All expected columns found: {LON_COL}, {LAT_COL}, {RH95_COL}")
+
+# Check rh95 specifically
+rh95_nulls    = gedi_df[RH95_COL].isnull().sum()
+rh95_zeros    = (gedi_df[RH95_COL] == 0).sum()
+rh95_negative = (gedi_df[RH95_COL] < 0).sum()
+rh95_valid    = gedi_df[RH95_COL].between(0, 100).sum()
+
+print(f"\n  rh95 column summary:")
+print(f"    Total rows:       {len(gedi_df):,}")
+print(f"    Null values:      {rh95_nulls:,}  ({100*rh95_nulls/len(gedi_df):.1f}%)")
+print(f"    Zero values:      {rh95_zeros:,}")
+print(f"    Negative values:  {rh95_negative:,}")
+print(f"    Valid (0–100 m):  {rh95_valid:,}  ({100*rh95_valid/len(gedi_df):.1f}%)")
+
+if rh95_valid == 0:
+    print(f"\n  *** WARNING: NO valid rh95 values found (0–100 m range).")
+    print(f"      The CSV may be empty, corrupt, or rh95 may be stored under a different column name.")
+    raise SystemExit("No valid rh95 data — check your CSV before continuing.")
+elif rh95_valid / len(gedi_df) < 0.1:
+    print(f"\n  *** WARNING: Less than 10% of rows have valid rh95 values. Check data quality.")
+else:
+    print(f"\n  ✓ rh95 data looks usable.")
+
+print("\n" + "=" * 60)
+print("  DIAGNOSTIC COMPLETE — continuing with processing")
+print("=" * 60 + "\n")
+
+# Validate columns
+for col in [LON_COL, LAT_COL, RH95_COL]:
+    if col not in gedi_df.columns:
+        raise ValueError(
+            f"\n  Column '{col}' not found!\n"
+            f"  Available columns: {list(gedi_df.columns)}\n"
+            f"  Update LON_COL / LAT_COL / RH95_COL at the top of the script."
+        )
+
+# Keep only needed columns and drop nulls
+gedi_df = gedi_df[[LON_COL, LAT_COL, RH95_COL]].dropna()
+print(f"      {len(gedi_df):,} points after dropping nulls")
+
+# Filter out invalid rh95 values
+gedi_df = gedi_df[(gedi_df[RH95_COL] >= 0) & (gedi_df[RH95_COL] <= 100)]
+print(f"      {len(gedi_df):,} points after filtering rh95 to 0–100 m")
+
+# No subsampling — all points are used via chunked distance calculation
+
+# --- Build GeoDataFrame and reproject ---
+print("\n[2/6] Building GeoDataFrame and reprojecting to UTM...")
+geometry = [Point(xy) for xy in zip(gedi_df[LON_COL], gedi_df[LAT_COL])]
+gedi_gdf = gpd.GeoDataFrame(gedi_df, geometry=geometry, crs=INPUT_CRS)
+gedi_gdf = gedi_gdf.to_crs(METRIC_CRS)
+
+# --- Load Roads ---
+print(f"\n[3/6] Loading roads from File Geodatabase...")
+roads_gdf = gpd.read_file(roads_gdb_path, layer=roads_layer)
+if roads_gdf.crs != gedi_gdf.crs:
+    roads_gdf = roads_gdf.to_crs(METRIC_CRS)
+print(f"      Loaded {len(roads_gdf):,} road features, reprojected to UTM")
+
+# =============================================================================
+# 3. DISTANCE TO NEAREST ROAD
+# =============================================================================
+
+print("\n[4/6] Calculating distance to nearest road (spatial index — fast)...")
+
+# --- Build STRtree spatial index on road segments ---
+# This lets each point query only nearby roads rather than checking all 165k features
+print("      Building STRtree spatial index on road segments...")
+road_geoms = list(roads_gdf.geometry)
+tree = STRtree(road_geoms)
+print(f"      Index built on {len(road_geoms):,} road geometries")
+
+# --- Chunked distance calculation using spatial index ---
+n_total  = len(gedi_gdf)
+n_chunks = int(np.ceil(n_total / CHUNK_SIZE))
+print(f"      {n_total:,} points → {n_chunks} chunks of {CHUNK_SIZE:,}\n")
+
+distances   = np.empty(n_total, dtype=np.float64)
+import time
+t0 = time.time()
+
+for i in range(n_chunks):
+    start  = i * CHUNK_SIZE
+    end    = min(start + CHUNK_SIZE, n_total)
+    chunk  = gedi_gdf.iloc[start:end]
+
+    # For each point: find nearest road geometry via index, then get exact distance
+    chunk_dists = []
+    for pt in chunk.geometry:
+        nearest_idx  = tree.nearest(pt)          # index of nearest road segment
+        nearest_geom = road_geoms[nearest_idx]
+        chunk_dists.append(pt.distance(nearest_geom))
+    distances[start:end] = chunk_dists
+
+    # Progress with time estimate
+    elapsed     = time.time() - t0
+    rate        = end / elapsed                  # points per second
+    remaining   = (n_total - end) / rate
+    mins_left   = remaining / 60
+    print(f"      Chunk {i+1:>3}/{n_chunks} complete  "
+          f"({end:,} / {n_total:,} points)  "
+          f"~{mins_left:.0f} min remaining")
+
+gedi_gdf["dist_to_road_m"] = distances
+
+print(f"\n      Total time: {(time.time()-t0)/60:.1f} minutes")
+print(f"      Min:  {gedi_gdf['dist_to_road_m'].min():.0f} m")
+print(f"      Max:  {gedi_gdf['dist_to_road_m'].max():.0f} m")
+print(f"      Mean: {gedi_gdf['dist_to_road_m'].mean():.0f} m")
+
+# Save CSV with distances
+output_csv = os.path.join(output_folder, "gedi_with_road_distances.csv")
+gedi_gdf.drop(columns="geometry").to_csv(output_csv, index=False)
+print(f"\n      Saved: {output_csv}")
+
+# =============================================================================
+# 4. LINEAR REGRESSION
+# =============================================================================
+
+print("\n[5/6] Running regression models...")
+
+df = gedi_gdf[[RH95_COL, "dist_to_road_m"]].dropna().copy()
+df["dist_km"]  = df["dist_to_road_m"] / 1000
+df["log_dist"] = np.log1p(df["dist_to_road_m"])
+
+X_km  = df["dist_km"].values
+X_log = df["log_dist"].values
+y     = df[RH95_COL].values
+
+# Model A — linear
+slope_A, intercept_A, r_A, p_A, se_A = stats.linregress(X_km, y)
+
+# Model B — log-transformed distance
+slope_B, intercept_B, r_B, p_B, se_B = stats.linregress(X_log, y)
+
+# Full OLS summary (Model A)
+X_ols     = sm.add_constant(X_km)
+ols_model = sm.OLS(y, X_ols).fit()
+
+print("\n" + "=" * 55)
+print("  REGRESSION RESULTS")
+print("=" * 55)
+print(f"\n  Model A — Linear distance:")
+print(f"    rh95 = {slope_A:.4f} × dist_km + {intercept_A:.4f}")
+print(f"    R²      = {r_A**2:.4f}")
+print(f"    p-value = {p_A:.4e}")
+print(f"    Std Err = {se_A:.4f}")
+
+print(f"\n  Model B — Log(distance) [often stronger for road effects]:")
+print(f"    rh95 = {slope_B:.4f} × ln(dist_m) + {intercept_B:.4f}")
+print(f"    R²      = {r_B**2:.4f}")
+print(f"    p-value = {p_B:.4e}")
+
+print(f"\n  Full OLS Summary (Model A):\n")
+print(ols_model.summary())
+
+# =============================================================================
+# 5. PLOTS
+# =============================================================================
+
+print("\n[6/6] Generating plots...")
+sns.set_style("whitegrid")
+
+# ── PLOT 1: Scatter + Both Regression Lines ────────────────────────────────────
+fig, ax = plt.subplots(figsize=(11, 7))
+
+# Hexbin density scatter (handles millions of points cleanly)
+hb = ax.hexbin(
+    df["dist_km"], df[RH95_COL],
+    gridsize=80, cmap="YlGn", mincnt=1, linewidths=0.2
+)
+fig.colorbar(hb, ax=ax, label="Point Density")
+
+# Model A line
+x_line   = np.linspace(df["dist_km"].min(), df["dist_km"].max(), 500)
+y_line_A = slope_A * x_line + intercept_A
+ax.plot(x_line, y_line_A, color="royalblue", linewidth=2.5,
+        label=f"Linear:  rh95 = {slope_A:.3f}·d + {intercept_A:.2f}  |  R²={r_A**2:.3f}  p={p_A:.2e}")
+
+# Model B line (plotted in km space)
+x_log_vals = np.log1p(x_line * 1000)  # convert km back to m for log
+y_line_B   = slope_B * x_log_vals + intercept_B
+ax.plot(x_line, y_line_B, color="darkorange", linewidth=2.5, linestyle="--",
+        label=f"Log(dist): rh95 = {slope_B:.3f}·ln(d) + {intercept_B:.2f}  |  R²={r_B**2:.3f}  p={p_B:.2e}")
+
+ax.set_xlabel("Distance to Nearest Road (km)", fontsize=13)
+ax.set_ylabel("GEDI rh95 Canopy Height (m)", fontsize=13)
+ax.set_title("GEDI Canopy Height (rh95) vs. Distance to Roads\nPará, Brazil",
+             fontsize=15, fontweight="bold")
+ax.legend(fontsize=10, loc="lower right")
+plt.tight_layout()
+
+p1 = os.path.join(output_folder, "scatter_rh95_vs_road_distance.png")
+plt.savefig(p1, dpi=300)
+plt.show()
+print(f"      Saved: {p1}")
+
+# ── PLOT 2: Binned Mean rh95 ───────────────────────────────────────────────────
+bins     = np.arange(0, MAX_DIST + BIN_SIZE, BIN_SIZE)
+bin_mids = (bins[:-1] + BIN_SIZE / 2) / 1000  # in km
+
+df_bin = df[df["dist_to_road_m"] <= MAX_DIST].copy()
+df_bin["dist_bin"] = pd.cut(df_bin["dist_to_road_m"], bins=bins)
+
+binned = df_bin.groupby("dist_bin", observed=True)[RH95_COL].agg(
+    mean="mean", std="std", count="count"
+).reset_index()
+binned["dist_mid_km"] = bin_mids
+binned["se"] = binned["std"] / np.sqrt(binned["count"])
+
+fig, ax = plt.subplots(figsize=(11, 6))
+ax.fill_between(
+    binned["dist_mid_km"],
+    binned["mean"] - binned["se"],
+    binned["mean"] + binned["se"],
+    alpha=0.3, color="darkgreen", label="±1 SE"
+)
+ax.plot(binned["dist_mid_km"], binned["mean"],
+        marker="o", markersize=5, color="darkgreen", linewidth=2,
+        label="Mean rh95 per distance band")
+
+# Annotate n per bin
+for _, row in binned.iterrows():
+    if pd.notna(row["mean"]):
+        ax.annotate(f"n={int(row['count']):,}",
+                    xy=(row["dist_mid_km"], row["mean"]),
+                    xytext=(0, 8), textcoords="offset points",
+                    fontsize=6.5, ha="center", color="gray")
+
+ax.set_xlabel("Distance to Nearest Road (km)", fontsize=13)
+ax.set_ylabel("Mean GEDI rh95 Canopy Height (m)", fontsize=13)
+ax.set_title(f"Mean Canopy Height by Distance Band ({BIN_SIZE/1000:.0f} km bins)\nPará, Brazil",
+             fontsize=15, fontweight="bold")
+ax.legend(fontsize=11)
+plt.tight_layout()
+
+p2 = os.path.join(output_folder, "binned_rh95_by_road_distance.png")
+plt.savefig(p2, dpi=300)
+plt.show()
+print(f"      Saved: {p2}")
+
+# ── PLOT 3: Residual Diagnostics ──────────────────────────────────────────────
+y_pred    = slope_A * df["dist_km"].values + intercept_A
+residuals = y - y_pred
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+axes[0].scatter(y_pred, residuals, alpha=0.05, s=4, color="steelblue")
+axes[0].axhline(0, color="red", linewidth=1.5, linestyle="--")
+axes[0].set_xlabel("Fitted Values (m)", fontsize=12)
+axes[0].set_ylabel("Residuals (m)", fontsize=12)
+axes[0].set_title("Residuals vs. Fitted", fontsize=13)
+
+stats.probplot(residuals, dist="norm", plot=axes[1])
+axes[1].set_title("Q-Q Plot of Residuals", fontsize=13)
+
+plt.suptitle("Regression Diagnostics — Linear Model A", fontsize=14, fontweight="bold")
+plt.tight_layout()
+
+p3 = os.path.join(output_folder, "regression_diagnostics.png")
+plt.savefig(p3, dpi=300)
+plt.show()
+print(f"      Saved: {p3}")
+
+# =============================================================================
+# DONE
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("  COMPLETE. Outputs in:", output_folder)
+print("    gedi_with_road_distances.csv")
+print("    scatter_rh95_vs_road_distance.png")
+print("    binned_rh95_by_road_distance.png")
+print("    regression_diagnostics.png")
+print("=" * 60)
