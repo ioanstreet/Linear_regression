@@ -1,0 +1,482 @@
+# =============================================================================
+# GEDI Canopy Height vs. Distance to Roads — Pará, Brazil
+# ALL FIGURES — 2026 Dataset
+#
+# INPUT:  gedi_prodes_2026_joined.csv  (already has road distances joined)
+# OUTPUT: 8 figures + regression stats, all saved with _2026 suffix
+#
+# NOTE: This script assumes dist_to_road_m already exists in the CSV.
+#       If the column has a different name the diagnostic will tell you.
+# =============================================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.colors import LogNorm
+from scipy import stats
+from scipy.stats import gaussian_kde
+import warnings
+import os
+
+warnings.filterwarnings("ignore")
+
+# =============================================================================
+# USER INPUTS — EDIT IF NEEDED
+# =============================================================================
+
+input_csv    = r"C:\Users\istreet\Downloads\Linear_Regression_all_2026\gedi_with_road_distances.csv"
+output_folder = r"C:\Users\istreet\Downloads\Linear_Regression_all_2026"
+
+# Expected column names — script will auto-detect if these are wrong
+RH95_COL = "rh95"
+DIST_COL = "dist_to_road_m"   # distance in metres — will be auto-detected if different
+
+# =============================================================================
+# 1. LOAD + DIAGNOSTIC
+# =============================================================================
+
+os.makedirs(output_folder, exist_ok=True)
+
+def out(filename):
+    """Append _2026 before the file extension."""
+    name, ext = os.path.splitext(filename)
+    return os.path.join(output_folder, f"{name}_2026{ext}")
+
+print("=" * 65)
+print("  GEDI Road Distance Analysis — Pará 2026 Dataset")
+print("=" * 65)
+
+print("\n[1/9] Loading CSV...")
+df = pd.read_csv(input_csv)
+print(f"      Loaded {len(df):,} rows")
+print(f"      Columns: {list(df.columns)}")
+
+# --- Auto-detect distance column if needed ---
+if DIST_COL not in df.columns:
+    candidates = [c for c in df.columns if 'dist' in c.lower()]
+    if candidates:
+        DIST_COL = candidates[0]
+        print(f"      Auto-detected distance column: '{DIST_COL}'")
+    else:
+        print(f"\n  *** ERROR: No distance column found.")
+        print(f"      Available columns: {list(df.columns)}")
+        raise SystemExit("Update DIST_COL at the top of the script.")
+
+# --- Auto-detect rh95 column ---
+if RH95_COL not in df.columns:
+    candidates = [c for c in df.columns if 'rh95' in c.lower() or 'rh_95' in c.lower()]
+    if candidates:
+        RH95_COL = candidates[0]
+        print(f"      Auto-detected rh95 column: '{RH95_COL}'")
+    else:
+        print(f"\n  *** ERROR: No rh95 column found.")
+        print(f"      Available columns: {list(df.columns)}")
+        raise SystemExit("Update RH95_COL at the top of the script.")
+
+# --- Convert distance to km ---
+# Check if column is already in km (values would be tiny if in metres for Pará)
+if df[DIST_COL].median() > 500:
+    df['dist_km'] = df[DIST_COL] / 1000
+    print(f"      Distance column appears to be in metres — converting to km")
+else:
+    df['dist_km'] = df[DIST_COL]
+    print(f"      Distance column appears to already be in km")
+
+# --- Diagnostic summary ---
+print("\n" + "=" * 65)
+print("  DATA DIAGNOSTIC")
+print("=" * 65)
+print(f"\n  Rows:              {len(df):,}")
+print(f"  rh95 nulls:        {df[RH95_COL].isnull().sum():,}")
+print(f"  rh95 range:        {df[RH95_COL].min():.2f} – {df[RH95_COL].max():.2f} m")
+print(f"  Distance nulls:    {df[DIST_COL].isnull().sum():,}")
+print(f"  Distance range:    {df['dist_km'].min():.2f} – {df['dist_km'].max():.2f} km")
+print(f"\n  First 3 rows:")
+print(df[[RH95_COL, DIST_COL, 'dist_km']].head(3).to_string())
+
+# --- Filter to valid data ---
+df = df[[RH95_COL, 'dist_km']].dropna()
+df = df[(df[RH95_COL] >= 0) & (df[RH95_COL] <= 100)]
+df = df[df['dist_km'] >= 0]
+print(f"\n  Valid points for analysis: {len(df):,}")
+print("=" * 65)
+
+# =============================================================================
+# 2. REGRESSION MODELS
+# =============================================================================
+
+print("\n[2/9] Running regression models...")
+
+# Clip to 99.5th percentile for plotting (keeps all data for regression)
+dist_max_plot = df['dist_km'].quantile(0.995)
+rh95_max_plot = df[RH95_COL].quantile(0.995)
+df_plot = df[(df['dist_km'] <= dist_max_plot) & (df[RH95_COL] <= rh95_max_plot)].copy()
+df_pos  = df[df['dist_km'] > 0].copy()  # positive distances for log models
+
+# Model A — linear
+slope_A, intercept_A, r_A, p_A, se_A = stats.linregress(df['dist_km'], df[RH95_COL])
+
+# Model B — log-transformed distance
+df_pos['log_dist'] = np.log1p(df_pos['dist_km'] * 1000)  # log of metres
+slope_B, intercept_B, r_B, p_B, se_B = stats.linregress(df_pos['log_dist'], df_pos[RH95_COL])
+
+# Zone stats
+near   = df[df['dist_km'] <= 5]
+medium = df[(df['dist_km'] > 5) & (df['dist_km'] <= 20)]
+far    = df[df['dist_km'] > 20]
+
+print("\n" + "=" * 65)
+print("  REGRESSION RESULTS")
+print("=" * 65)
+print(f"\n  Total points used: {len(df):,}")
+print(f"\n  Model A — Linear:")
+print(f"    rh95 = {slope_A:.4f} × dist_km + {intercept_A:.4f}")
+print(f"    R² = {r_A**2:.4f}   p = {p_A:.4e}   SE = {se_A:.4f}")
+print(f"\n  Model B — Log(distance):")
+print(f"    rh95 = {slope_B:.4f} × ln(dist_m) + {intercept_B:.4f}")
+print(f"    R² = {r_B**2:.4f}   p = {p_B:.4e}")
+print(f"\n  Zone means:")
+print(f"    Near  (0–5 km):   {near[RH95_COL].mean():.2f} m  (n={len(near):,})")
+print(f"    Medium (5–20 km): {medium[RH95_COL].mean():.2f} m  (n={len(medium):,})")
+print(f"    Far   (>20 km):   {far[RH95_COL].mean():.2f} m  (n={len(far):,})")
+
+dist_95 = df['dist_km'].quantile(0.95)
+print(f"\n  Road penetration: 95% of points within {dist_95:.2f} km of a road")
+print("=" * 65)
+
+# Shared regression line arrays
+x_line     = np.linspace(0, dist_max_plot, 500)
+y_line_A   = slope_A * x_line + intercept_A
+x_log_line = np.logspace(np.log10(max(0.01, df_pos['dist_km'].min())), np.log10(dist_max_plot), 500)
+y_line_B   = slope_B * np.log1p(x_log_line * 1000) + intercept_B
+
+stats_box  = f"n = {len(df):,}\nR² = {r_A**2:.4f}\nSlope = {slope_A:.4f} m/km"
+props      = dict(boxstyle='round', facecolor='wheat', alpha=0.9)
+
+# =============================================================================
+# FIGURE 1: Hexbin — linear x-axis
+# =============================================================================
+
+print("\n[3/9] Figure 1 — Hexbin scatter (linear x-axis)...")
+
+fig, ax = plt.subplots(figsize=(12, 8))
+hb = ax.hexbin(df_plot['dist_km'], df_plot[RH95_COL],
+               gridsize=100, cmap='YlOrRd', mincnt=1,
+               norm=LogNorm(), linewidths=0.1, edgecolors='face')
+ax.plot(x_line, y_line_A, 'b-', linewidth=2.5,
+        label=f'Linear: y = {slope_A:.3f}x + {intercept_A:.2f}')
+ax.plot(x_log_line, y_line_B, 'darkorange', linewidth=2.5, linestyle='--',
+        label=f'Log(dist): R²={r_B**2:.3f}')
+plt.colorbar(hb, ax=ax, label='Number of GEDI Points (log scale)')
+ax.set_xlabel('Distance to Nearest Road (km)', fontsize=14, fontweight='bold')
+ax.set_ylabel('Canopy Height — RH95 (m)', fontsize=14, fontweight='bold')
+ax.set_title('Canopy Height vs Road Distance — Pará 2026\n(Hexbin Density)', fontsize=16, fontweight='bold')
+ax.text(0.72, 0.05, stats_box, transform=ax.transAxes, fontsize=11,
+        verticalalignment='bottom', bbox=props)
+ax.legend(fontsize=11, loc='upper left')
+ax.grid(True, alpha=0.3, linestyle='--')
+plt.tight_layout()
+plt.savefig(out('hexbin_rh95_vs_road_distance.png'), dpi=300, bbox_inches='tight')
+plt.close()
+print(f"      Saved: hexbin_rh95_vs_road_distance_2026.png")
+
+# =============================================================================
+# FIGURE 2: Hexbin — log x-axis
+# =============================================================================
+
+print("\n[4/9] Figure 2 — Hexbin scatter (log x-axis)...")
+
+fig, ax = plt.subplots(figsize=(14, 8))
+hb = ax.hexbin(df_pos['dist_km'], df_pos[RH95_COL],
+               gridsize=80, cmap='YlOrRd', mincnt=1,
+               norm=LogNorm(), linewidths=0.1, edgecolors='face')
+ax.plot(x_log_line, y_line_B, 'b-', linewidth=3,
+        label=f'Log fit: y = {slope_B:.3f}·ln(d) + {intercept_B:.2f}  R²={r_B**2:.4f}')
+ax.set_xscale('log')
+plt.colorbar(hb, ax=ax, label='Point Density (log scale)')
+ax.set_xlabel('Distance to Nearest Road (km, log scale)', fontsize=14, fontweight='bold')
+ax.set_ylabel('Canopy Height — RH95 (m)', fontsize=14, fontweight='bold')
+ax.set_title('Canopy Height vs Road Distance — LOG SCALE\nPará 2026', fontsize=16, fontweight='bold')
+ax.text(0.72, 0.05, stats_box, transform=ax.transAxes, fontsize=11,
+        verticalalignment='bottom', bbox=props)
+ax.legend(fontsize=11, loc='upper left')
+ax.grid(True, alpha=0.3, linestyle='--', which='both')
+plt.tight_layout()
+plt.savefig(out('hexbin_LOGSCALE.png'), dpi=300, bbox_inches='tight')
+plt.close()
+print(f"      Saved: hexbin_LOGSCALE_2026.png")
+
+# =============================================================================
+# FIGURE 3: 2D Histogram with log bins
+# =============================================================================
+
+print("\n[5/9] Figure 3 — 2D histogram with log bins...")
+
+fig, ax = plt.subplots(figsize=(14, 8))
+x_bins = np.logspace(np.log10(max(0.01, df_pos['dist_km'].min())), np.log10(dist_max_plot), 100)
+y_bins = np.linspace(0, rh95_max_plot, 100)
+h = ax.hist2d(df_pos['dist_km'], df_pos[RH95_COL],
+              bins=[x_bins, y_bins], cmap='YlOrRd', norm=LogNorm(), cmin=1)
+ax.plot(x_log_line, y_line_B, 'b-', linewidth=3,
+        label=f'Log fit: y = {slope_B:.3f}·ln(d) + {intercept_B:.2f}')
+ax.set_xscale('log')
+plt.colorbar(h[3], ax=ax, label='Number of Points (log scale)')
+ax.set_xlabel('Distance to Nearest Road (km, log scale)', fontsize=14, fontweight='bold')
+ax.set_ylabel('Canopy Height — RH95 (m)', fontsize=14, fontweight='bold')
+ax.set_title('2D Histogram — Logarithmic Bins\nPará 2026', fontsize=16, fontweight='bold')
+ax.text(0.98, 0.05, stats_box, transform=ax.transAxes, fontsize=11,
+        verticalalignment='bottom', horizontalalignment='right', bbox=props)
+ax.legend(fontsize=12, loc='upper left')
+ax.grid(True, alpha=0.3, which='both', linestyle='--')
+plt.tight_layout()
+plt.savefig(out('logscale_histogram2d.png'), dpi=300, bbox_inches='tight')
+plt.close()
+print(f"      Saved: logscale_histogram2d_2026.png")
+
+# =============================================================================
+# FIGURE 4: Binned averages with sample size panel
+# =============================================================================
+
+print("\n[6/9] Figure 4 — Binned averages + sample size...")
+
+bins      = np.arange(0, dist_max_plot + 5, 5)
+bin_ctrs  = (bins[:-1] + bins[1:]) / 2
+b_mean, b_std, b_n = [], [], []
+for i in range(len(bins) - 1):
+    seg = df[(df['dist_km'] >= bins[i]) & (df['dist_km'] < bins[i+1])][RH95_COL]
+    b_mean.append(seg.mean()); b_std.append(seg.std()); b_n.append(len(seg))
+b_mean = np.array(b_mean); b_std = np.array(b_std); b_n = np.array(b_n)
+
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), gridspec_kw={'height_ratios': [3, 1]})
+ax1.errorbar(bin_ctrs, b_mean, yerr=b_std, fmt='o-', color='darkblue',
+             ecolor='lightblue', linewidth=2, markersize=6, capsize=5, alpha=0.8,
+             label='Mean ± Std Dev')
+ax1.plot(x_line, y_line_A, 'r--', linewidth=2, label='Linear regression')
+ax1.set_ylabel('Canopy Height — RH95 (m)', fontsize=13, fontweight='bold')
+ax1.set_title('Binned Average Canopy Height vs Road Distance\nPará 2026', fontsize=15, fontweight='bold')
+ax1.legend(fontsize=11); ax1.grid(True, alpha=0.3, linestyle='--')
+ax1.set_xlim(0, dist_max_plot)
+
+ax2.bar(bin_ctrs, b_n, width=4.5, color='steelblue', alpha=0.7, edgecolor='black')
+ax2.set_xlabel('Distance to Nearest Road (km)', fontsize=13, fontweight='bold')
+ax2.set_ylabel('GEDI Points', fontsize=11, fontweight='bold')
+ax2.set_yscale('log')
+ax2.grid(True, alpha=0.3, linestyle='--', axis='y')
+ax2.set_xlim(0, dist_max_plot)
+ax2.text(0.98, 0.95, f'Total: {len(df):,} points', transform=ax2.transAxes,
+         ha='right', va='top', fontsize=11, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+plt.tight_layout()
+plt.savefig(out('binned_with_distribution.png'), dpi=300, bbox_inches='tight')
+plt.close()
+print(f"      Saved: binned_with_distribution_2026.png")
+
+# =============================================================================
+# FIGURE 5: Zone comparison histograms
+# =============================================================================
+
+print("\n[7/9] Figure 5 — Zone comparison histograms...")
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharey=True)
+zones  = [(near, '0–5 km', 'Near Roads'), (medium, '5–20 km', 'Medium Distance'), (far, '>20 km', 'Far from Roads')]
+colors = ['#d62728', '#ff7f0e', '#2ca02c']
+for ax, (zdata, zlabel, ztitle), color in zip(axes, zones, colors):
+    ax.hist(zdata[RH95_COL], bins=50, color=color, alpha=0.7, edgecolor='black')
+    ax.axvline(zdata[RH95_COL].mean(), color='black', linestyle='--', linewidth=2,
+               label=f'Mean: {zdata[RH95_COL].mean():.1f} m')
+    ax.set_xlabel('RH95 (m)', fontsize=12, fontweight='bold')
+    ax.set_title(f'{ztitle}\n({zlabel}) — n={len(zdata):,}', fontsize=13, fontweight='bold')
+    ax.legend(); ax.grid(True, alpha=0.3, axis='y')
+axes[0].set_ylabel('Frequency', fontsize=12, fontweight='bold')
+fig.suptitle('Canopy Height Distribution by Distance Zone — Pará 2026', fontsize=15, fontweight='bold', y=1.02)
+plt.tight_layout()
+plt.savefig(out('zone_comparison.png'), dpi=300, bbox_inches='tight')
+plt.close()
+print(f"      Saved: zone_comparison_2026.png")
+
+# =============================================================================
+# FIGURE 6: Cumulative distribution
+# =============================================================================
+
+print("\n[8/9] Figure 6 — Cumulative distribution...")
+
+sorted_dist  = np.sort(df['dist_km'].values)
+cum_pct      = np.arange(1, len(sorted_dist) + 1) / len(sorted_dist) * 100
+
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+ax1.plot(sorted_dist, cum_pct, color='darkblue', linewidth=2)
+ax1.axhline(95, color='red', linestyle='--', linewidth=2, label='95th percentile')
+ax1.axvline(dist_95, color='red', linestyle='--', linewidth=2)
+ax1.text(dist_95 * 1.02, 50, f'95% within\n{dist_95:.1f} km',
+         fontsize=12, bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.8))
+ax1.set_xlabel('Distance to Nearest Road (km)', fontsize=13, fontweight='bold')
+ax1.set_ylabel('Cumulative % of Points', fontsize=13, fontweight='bold')
+ax1.set_title('Road Penetration in Pará — Cumulative Distribution 2026', fontsize=15, fontweight='bold')
+ax1.grid(True, alpha=0.4); ax1.legend(); ax1.set_xlim(0, df['dist_km'].quantile(0.99))
+
+ax2.hist(df['dist_km'], bins=100, color='steelblue', alpha=0.7, edgecolor='black')
+ax2.axvline(df['dist_km'].median(), color='orange', linestyle='--', linewidth=2,
+            label=f'Median: {df["dist_km"].median():.1f} km')
+ax2.axvline(dist_95, color='red', linestyle='--', linewidth=2,
+            label=f'95th %ile: {dist_95:.1f} km')
+ax2.set_xlabel('Distance to Nearest Road (km)', fontsize=13, fontweight='bold')
+ax2.set_ylabel('Frequency', fontsize=13, fontweight='bold')
+ax2.set_yscale('log'); ax2.legend(); ax2.grid(True, alpha=0.4, axis='y')
+ax2.set_xlim(0, df['dist_km'].quantile(0.99))
+plt.tight_layout()
+plt.savefig(out('cumulative_distribution.png'), dpi=300, bbox_inches='tight')
+plt.close()
+print(f"      Saved: cumulative_distribution_2026.png")
+
+# =============================================================================
+# FIGURE 7: Balanced sampling hexbin
+# =============================================================================
+
+print("\n[9/9] Figure 7 — Balanced sampling plot...")
+
+bins_edges     = [0, 1, 5, 10, 20, 50, 500]
+samples_per_bin = 10_000
+sampled_parts  = []
+for lo, hi in zip(bins_edges[:-1], bins_edges[1:]):
+    seg = df[(df['dist_km'] >= lo) & (df['dist_km'] < hi)]
+    n   = min(len(seg), samples_per_bin)
+    if n > 0:
+        sampled_parts.append(seg.sample(n, random_state=42))
+        print(f"      Bin {lo}–{hi} km: {len(seg):,} pts → sampled {n:,}")
+df_bal = pd.concat(sampled_parts)
+
+coeffs_bal = np.polyfit(df_bal['dist_km'], df_bal[RH95_COL], 1)
+x_bal_line = np.linspace(0, df_bal['dist_km'].quantile(0.99), 200)
+y_bal_line = coeffs_bal[0] * x_bal_line + coeffs_bal[1]
+
+fig, ax = plt.subplots(figsize=(14, 8))
+hb = ax.hexbin(df_bal['dist_km'], df_bal[RH95_COL], gridsize=80,
+               cmap='viridis', mincnt=1, norm=LogNorm(), linewidths=0.1)
+ax.plot(x_bal_line, y_bal_line, 'r-', linewidth=2.5,
+        label=f'Balanced fit: y = {coeffs_bal[0]:.3f}x + {coeffs_bal[1]:.2f}')
+plt.colorbar(hb, ax=ax, label='Point Density (log scale)')
+ax.set_xlabel('Distance to Nearest Road (km)', fontsize=14, fontweight='bold')
+ax.set_ylabel('Canopy Height — RH95 (m)', fontsize=14, fontweight='bold')
+ax.set_title('Balanced Sampling Across Distance Bins — Pará 2026\n(Equal representation per distance range)',
+             fontsize=15, fontweight='bold')
+ax.text(0.72, 0.05, f'Balanced n = {len(df_bal):,}', transform=ax.transAxes,
+        fontsize=12, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+ax.legend(fontsize=11); ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig(out('balanced_sampling.png'), dpi=300, bbox_inches='tight')
+plt.close()
+print(f"      Saved: balanced_sampling_2026.png")
+
+# =============================================================================
+# FIGURE 8: Summary panel (all methods in one)
+# =============================================================================
+
+print("\n      Figure 8 — Summary panel...")
+
+fig = plt.figure(figsize=(18, 12))
+gs  = fig.add_gridspec(3, 2, hspace=0.35, wspace=0.3)
+
+# A — Zone bar chart
+ax1 = fig.add_subplot(gs[0, 0])
+zone_names = ['0–5 km', '5–20 km', '>20 km']
+zone_means = [near[RH95_COL].mean(), medium[RH95_COL].mean(), far[RH95_COL].mean()]
+zone_ns    = [len(near), len(medium), len(far)]
+bars = ax1.bar(zone_names, zone_means, color=['#d62728','#ff7f0e','#2ca02c'],
+               alpha=0.75, edgecolor='black', linewidth=1.5)
+for bar, mean, n in zip(bars, zone_means, zone_ns):
+    ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+             f'{mean:.1f} m\nn={n:,}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+ax1.set_ylabel('Mean RH95 (m)', fontsize=12, fontweight='bold')
+ax1.set_title('A) Mean Canopy Height by Zone', fontsize=13, fontweight='bold')
+ax1.grid(True, alpha=0.3, axis='y')
+
+# B — Percentile table
+ax2 = fig.add_subplot(gs[0, 1])
+ax2.axis('off')
+pct_data = [[f'{p}%', f'{df["dist_km"].quantile(p/100):.2f} km'] for p in [50,75,90,95,99]]
+tbl = ax2.table(cellText=pct_data, colLabels=['Percentile', 'Distance to Road'],
+                cellLoc='center', loc='center', colWidths=[0.3, 0.4])
+tbl.auto_set_font_size(False); tbl.set_fontsize(11); tbl.scale(1, 2.5)
+for i in range(len(pct_data) + 1):
+    tbl[(i,0)].set_facecolor('#e6f2ff')
+    tbl[(i,1)].set_facecolor('#fff4e6')
+ax2.set_title('B) Road Penetration Percentiles', fontsize=13, fontweight='bold', pad=20)
+
+# C — Full hexbin log scale
+ax3 = fig.add_subplot(gs[1, :])
+hb3 = ax3.hexbin(df_pos['dist_km'], df_pos[RH95_COL], gridsize=60,
+                  cmap='YlOrRd', mincnt=1, norm=LogNorm())
+ax3.plot(x_log_line, y_line_B, 'b-', linewidth=2)
+ax3.set_xscale('log')
+ax3.set_xlabel('Distance to Road (km, log scale)', fontsize=12, fontweight='bold')
+ax3.set_ylabel('RH95 (m)', fontsize=12, fontweight='bold')
+ax3.set_title(f'C) Full Dataset — Hexbin Log Scale (n={len(df):,})', fontsize=13, fontweight='bold')
+ax3.grid(True, alpha=0.3, which='both')
+plt.colorbar(hb3, ax=ax3, label='Density')
+
+# D — Cumulative distribution
+ax4 = fig.add_subplot(gs[2, :])
+ax4.plot(sorted_dist, cum_pct, color='darkblue', linewidth=2)
+ax4.axhline(95, color='red', linestyle='--', linewidth=1.5)
+ax4.axvline(dist_95, color='red', linestyle='--', linewidth=1.5)
+ax4.fill_between(sorted_dist, 0, cum_pct, alpha=0.2, color='blue')
+ax4.set_xlabel('Distance to Nearest Road (km)', fontsize=12, fontweight='bold')
+ax4.set_ylabel('Cumulative %', fontsize=12, fontweight='bold')
+ax4.set_title(f'D) Cumulative Distribution — 95% within {dist_95:.1f} km', fontsize=13, fontweight='bold')
+ax4.grid(True, alpha=0.4)
+ax4.set_xlim(0, df['dist_km'].quantile(0.99))
+
+plt.suptitle('GEDI Canopy Height vs. Road Distance — Pará 2026', fontsize=16, fontweight='bold', y=1.01)
+plt.savefig(out('SUMMARY_ALL_METHODS.png'), dpi=300, bbox_inches='tight')
+plt.close()
+print(f"      Saved: SUMMARY_ALL_METHODS_2026.png")
+
+# =============================================================================
+# REGRESSION DIAGNOSTICS
+# =============================================================================
+
+print("\n      Figure 9 — Regression diagnostics...")
+
+y_pred    = slope_A * df['dist_km'].values + intercept_A
+residuals = df[RH95_COL].values - y_pred
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+axes[0].scatter(y_pred, residuals, alpha=0.02, s=2, color='steelblue', rasterized=True)
+axes[0].axhline(0, color='red', linewidth=1.5, linestyle='--')
+axes[0].set_xlabel('Fitted Values (m)', fontsize=12); axes[0].set_ylabel('Residuals (m)', fontsize=12)
+axes[0].set_title('Residuals vs. Fitted', fontsize=13)
+
+stats.probplot(residuals, dist='norm', plot=axes[1])
+axes[1].set_title('Q-Q Plot of Residuals', fontsize=13)
+plt.suptitle('Regression Diagnostics — Linear Model — Pará 2026', fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig(out('regression_diagnostics.png'), dpi=300, bbox_inches='tight')
+plt.close()
+print(f"      Saved: regression_diagnostics_2026.png")
+
+# =============================================================================
+# DONE
+# =============================================================================
+
+print("\n" + "=" * 65)
+print("  COMPLETE — all outputs in:", output_folder)
+print("=" * 65)
+print("  Files created (_2026 suffix):")
+files = [
+    "hexbin_rh95_vs_road_distance_2026.png",
+    "hexbin_LOGSCALE_2026.png",
+    "logscale_histogram2d_2026.png",
+    "binned_with_distribution_2026.png",
+    "zone_comparison_2026.png",
+    "cumulative_distribution_2026.png",
+    "balanced_sampling_2026.png",
+    "SUMMARY_ALL_METHODS_2026.png",
+    "regression_diagnostics_2026.png",
+]
+for f in files:
+    print(f"    {f}")
+print("=" * 65)
+print(f"\n  Key results:")
+print(f"    Linear model:  rh95 = {slope_A:.4f} × dist_km + {intercept_A:.4f}  (R²={r_A**2:.4f})")
+print(f"    Log model:     rh95 = {slope_B:.4f} × ln(dist_m) + {intercept_B:.4f}  (R²={r_B**2:.4f})")
+print(f"    95% of points within {dist_95:.2f} km of a road")
